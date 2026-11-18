@@ -146,6 +146,73 @@ The first argument is the location (as a string) to write the output, **or** a f
   Set the ID3v2 version used by ffmpeg to add tags to the output file. If you want Windows Exlorer to display tags, use `"3"` here ([source](http://superuser.com/a/453133)).
 - `cover` | example: `"/path/to/imgfile.png"`
   Allows you to supply a cover image (path to the image file). Currently, only MP3 files allow this keyword argument. Cover image must be a jpeg, png, bmp, or tiff file.
+- `bit_depth` | example: `10` | default: `None`
+  Export through the explicit bit-depth path (see "Explicit bit-depth conversion" below). Only PCM containers (`"wav"`, `"raw"`) are supported; anything else raises `pydub.exceptions.UnsupportedBitDepthError` with a suggested alternative instead of silently falling back to 8 bits. Cannot be combined with `bitrate`, `parameters`, `tags` or `cover`. When omitted, export behaves exactly as before.
+- `dither` | example: `"triangular"` | default: `"none"`
+  Dither strategy applied when `bit_depth` requires downscaling: `"none"` (plain truncation, matching the historical behavior), `"rectangular"` or `"triangular"`.
+
+## Explicit bit-depth conversion
+
+`pydub.bitdepth` provides an opt-in path for high bit depth material so
+that e.g. 10-bit audio (carried in 16-bit containers, the audio
+equivalent of pixel formats like `yuv420p10le`) is never silently
+truncated to 8 bits. Samples are stored left-aligned inside their
+containers and every conversion is explicit — the intermediate buffer
+always matches the target bit depth.
+
+Every `AudioSegment` now exposes a read-only-ish `bit_depth` attribute
+(logical precision, e.g. `10` for 10-bit samples in 16-bit containers).
+It defaults to the container depth (`sample_width * 8`), so existing
+code sees no behavior change. Declare a higher precision when
+constructing from raw data:
+
+```python
+from pydub import AudioSegment
+
+# 10-bit samples carried in 16-bit containers (left-aligned)
+seg = AudioSegment(data=raw_pcm, sample_width=2, frame_rate=48000,
+                   channels=2, bit_depth=10)
+```
+
+```python
+from pydub.bitdepth import convert_bit_depth, convert_batch, concatenate
+
+# 8-bit -> 10-bit upscale (exact, no artifacts)
+upgraded = convert_bit_depth(seg8, 10, dither="triangular")
+
+# mixed batches: each item keeps its own depth unless a target is given
+items = convert_batch([seg8, seg10, seg16])
+
+# mixed concatenation: each segment is converted individually towards
+# the highest input depth (never downgraded to the lowest)
+combined = concatenate([seg8, seg10])
+```
+
+`pydub.bitdepth.validate_bit_depth(seg)` raises
+`pydub.exceptions.BitDepthMismatchError` when the declared depth and the
+actual sample values disagree (e.g. samples exceeding the 8-bit range in
+data declared as 8-bit).
+
+### Migrating an 8-bit pipeline to 10-bit output
+
+```python
+# before: everything went through the regular 8-bit/16-bit path
+batch = [AudioSegment.from_file(f) for f in files]
+for seg in batch:
+    seg.export(out_name(seg), format="wav")
+
+# after: declare depths on the way in, convert explicitly on the way out
+from pydub.bitdepth import convert_batch
+batch = [AudioSegment.from_file(f) for f in files]  # bit_depth auto-detected
+for seg in convert_batch(batch, target_bit_depth=10, dither="triangular"):
+    seg.export(out_name(seg), format="wav", bit_depth=10)
+```
+
+All new parameters default to the previous behavior (`bit_depth=None`,
+`dither="none"`), so existing callers observe identical return values,
+exceptions and log output. Conversion logs are emitted on the
+`pydub.bitdepth` logger (enter/exit at DEBUG, failures at ERROR),
+following the same conventions as the `pydub.converter` logger.
 
 
 ### AudioSegment.empty()

@@ -17,6 +17,11 @@ setup(
     url='http://pydub.com',
     packages=['pydub'],
     long_description=__doc__,
+    # audioop was removed from the stdlib in Python 3.13 (PEP 594);
+    # audioop-lts provides the same module for newer interpreters
+    install_requires=[
+        'audioop-lts; python_version >= "3.13"',
+    ],
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: MIT License',

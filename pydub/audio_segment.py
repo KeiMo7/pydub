@@ -41,6 +41,10 @@ from .exceptions import (
     CouldntEncodeError,
     MissingAudioParameter,
 )
+from .bitdepth import (
+    CONTAINER_WIDTHS,
+    export_with_bit_depth,
+)
 
 if sys.version_info >= (3, 0):
     basestring = str
@@ -180,6 +184,8 @@ class AudioSegment(object):
         self.sample_width = kwargs.pop("sample_width", None)
         self.frame_rate = kwargs.pop("frame_rate", None)
         self.channels = kwargs.pop("channels", None)
+        explicit_bit_depth = kwargs.pop("bit_depth", None)
+        self.bit_depth = explicit_bit_depth
 
         audio_params = (self.sample_width, self.frame_rate, self.channels)
 
@@ -228,6 +234,8 @@ class AudioSegment(object):
             self.frame_rate = wav_data.sample_rate
             self.frame_width = self.channels * self.sample_width
             self._data = wav_data.raw_data
+            if self.bit_depth is None:
+                self.bit_depth = wav_data.bits_per_sample
             if self.sample_width == 1:
                 # convert from unsigned integers in wav
                 self._data = audioop.bias(self._data, 1, -128)
@@ -254,6 +262,18 @@ class AudioSegment(object):
             self._data = byte_buffer.getvalue()
             self.sample_width = 4
             self.frame_width = self.channels * self.sample_width
+
+        if self.bit_depth is None:
+            self.bit_depth = self.sample_width * 8
+        elif self.bit_depth not in CONTAINER_WIDTHS or \
+                CONTAINER_WIDTHS[self.bit_depth] != self.sample_width:
+            if explicit_bit_depth is not None:
+                raise ValueError(
+                    "bit_depth %r does not fit in sample_width %r" %
+                    (explicit_bit_depth, self.sample_width))
+            # non-standard depths read from file headers fall back to the
+            # container depth, matching the previous behavior
+            self.bit_depth = self.sample_width * 8
 
         super(AudioSegment, self).__init__(*args, **kwargs)
 
@@ -426,7 +446,8 @@ class AudioSegment(object):
             'sample_width': self.sample_width,
             'frame_rate': self.frame_rate,
             'frame_width': self.frame_width,
-            'channels': self.channels
+            'channels': self.channels,
+            'bit_depth': self.bit_depth
         }
         metadata.update(overrides)
         return self.__class__(data=data, metadata=metadata)
@@ -546,6 +567,8 @@ class AudioSegment(object):
                 'channels': channels,
                 'frame_width': channels * sample_width
             }
+            if kwargs.get('bit_depth') is not None:
+                metadata['bit_depth'] = kwargs['bit_depth']
             obj = cls(data=file.read(), metadata=metadata)
             if close_file:
                 file.close()
@@ -686,6 +709,8 @@ class AudioSegment(object):
                 'channels': channels,
                 'frame_width': channels * sample_width
             }
+            if kwargs.get('bit_depth') is not None:
+                metadata['bit_depth'] = kwargs['bit_depth']
             if start_second is None and duration is None:
                 return cls(data=file.read(), metadata=metadata)
             elif start_second is not None and duration is None:
@@ -822,7 +847,7 @@ class AudioSegment(object):
         return obj
 
     def export(self, out_f=None, format='mp3', codec=None, bitrate=None, parameters=None, tags=None, id3v2_version='4',
-               cover=None):
+               cover=None, bit_depth=None, dither=None):
         """
         Export an AudioSegment to a file with given options
 
@@ -855,7 +880,30 @@ class AudioSegment(object):
 
         cover (file)
             Set cover for audio file from image file. (png or jpg)
+
+        bit_depth (int)
+            Explicit output bit depth (8, 10, 16, 24 or 32). When given,
+            the audio is converted through the explicit bit-depth path
+            (see pydub.bitdepth) and written to a PCM container. When
+            omitted (default) the export behaves exactly as before.
+
+        dither (string)
+            Dither strategy used when bit_depth requires downscaling
+            ('none', 'rectangular' or 'triangular', default: 'none')
         """
+        if bit_depth is not None:
+            if parameters is not None or tags is not None or \
+                    cover is not None or bitrate is not None:
+                raise AttributeError(
+                    'parameters, bitrate, tags and cover are not supported '
+                    'together with bit_depth; the explicit bit-depth path '
+                    'only writes raw PCM containers')
+            out_f, _ = _fd_or_path_or_tempfile(out_f, 'wb+')
+            out_f.seek(0)
+            return export_with_bit_depth(
+                self, out_f, format=format, codec=codec,
+                bit_depth=bit_depth, dither=dither)
+
         id3v2_allowed_versions = ['3', '4']
 
         if format == "raw" and (codec is not None or parameters is not None):
@@ -1007,7 +1055,8 @@ class AudioSegment(object):
 
         return self._spawn(
             audioop.lin2lin(self._data, self.sample_width, sample_width),
-            overrides={'sample_width': sample_width, 'frame_width': frame_width}
+            overrides={'sample_width': sample_width, 'frame_width': frame_width,
+                       'bit_depth': sample_width * 8}
         )
 
     def set_frame_rate(self, frame_rate):

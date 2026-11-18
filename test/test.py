@@ -1,7 +1,9 @@
+import array
 from functools import partial
 import os
 import sys
 import unittest
+import wave
 from tempfile import (
     NamedTemporaryFile,
     mkdtemp,
@@ -9,11 +11,20 @@ from tempfile import (
 )
 import tempfile
 import struct
+from io import BytesIO
 
 from pydub import AudioSegment
 from pydub.audio_segment import extract_wav_headers
+from pydub.bitdepth import (
+    CONTAINER_WIDTHS,
+    convert_bit_depth,
+    convert_batch,
+    concatenate,
+    validate_bit_depth,
+)
 from pydub.utils import (
     db_to_float,
+    get_array_type,
     ratio_to_db,
     make_chunks,
     mediainfo,
@@ -27,6 +38,8 @@ from pydub.exceptions import (
     InvalidDuration,
     CouldntDecodeError,
     MissingAudioParameter,
+    UnsupportedBitDepthError,
+    BitDepthMismatchError,
 )
 from pydub.silence import (
     detect_silence,
@@ -1086,7 +1099,7 @@ class AudioSegmentTests(unittest.TestCase):
             tmp_wav_file.flush()
             self.assertRaises(CouldntDecodeError, AudioSegment.from_file, tmp_wav_file.name)
             files = os.listdir(tempfile.tempdir)
-            self.assertEquals(files, [os.path.basename(tmp_wav_file.name)])
+            self.assertEqual(files, [os.path.basename(tmp_wav_file.name)])
 
         if sys.platform == 'win32':
             os.remove(tmp_wav_file.name)
@@ -1109,7 +1122,7 @@ class SilenceTests(unittest.TestCase):
 
     def test_split_on_silence_complete_silence(self):
         seg = AudioSegment.silent(5000)
-        self.assertEquals( split_on_silence(seg), [] )
+        self.assertEqual( split_on_silence(seg), [] )
 
     def test_split_on_silence_test1(self):
         self.assertEqual(
@@ -1394,6 +1407,281 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class BitDepthTests(unittest.TestCase):
+
+    def make_segment(self, bit_depth, values, frame_rate=8000, channels=1):
+        # values are logical sample values; they are stored left-aligned
+        # inside the container matching the bit depth
+        width = CONTAINER_WIDTHS[bit_depth]
+        pad = width * 8 - bit_depth
+        typecode = get_array_type(width * 8)
+        data = array.array(typecode, [v << pad for v in values]).tobytes()
+        return AudioSegment(data=data, sample_width=width,
+                            frame_rate=frame_rate, channels=channels,
+                            bit_depth=bit_depth)
+
+    def logical_samples(self, seg):
+        pad = seg.sample_width * 8 - seg.bit_depth
+        return [s >> pad for s in seg.get_array_of_samples()]
+
+    def test_ten_bit_passthrough_keeps_depth_and_data(self):
+        values = list(range(-500, 500, 7))
+        seg = self.make_segment(10, values)
+        self.assertEqual(seg.bit_depth, 10)
+        self.assertEqual(seg.sample_width, 2)
+
+        # operations keep the declared depth, no 8-bit intermediate
+        self.assertEqual(seg[:10].bit_depth, 10)
+        self.assertEqual(self.logical_samples(seg), values)
+
+        # default export keeps the container and the samples untouched
+        out = seg.export(BytesIO(), format='wav')
+        out.seek(0)
+        wav_out = wave.open(out, 'rb')
+        self.assertEqual(wav_out.getsampwidth(), 2)
+        self.assertEqual(wav_out.readframes(wav_out.getnframes()),
+                         seg.raw_data)
+
+    def test_ten_bit_explicit_export_roundtrip(self):
+        values = list(range(-512, 512, 5))
+        seg = self.make_segment(10, values)
+        out = seg.export(BytesIO(), format='wav', bit_depth=10)
+        out.seek(0)
+        wav_out = wave.open(out, 'rb')
+        self.assertEqual(wav_out.getsampwidth(), 2)
+        self.assertEqual(wav_out.readframes(wav_out.getnframes()),
+                         seg.raw_data)
+
+    def test_eight_to_ten_bit_upscale_is_exact(self):
+        values = list(range(-128, 128))
+        seg8 = self.make_segment(8, values)
+        upgraded = convert_bit_depth(seg8, 10)
+        self.assertEqual(upgraded.bit_depth, 10)
+        self.assertEqual(upgraded.sample_width, 2)
+        # 8-bit values shifted into 10-bit precision, exactly
+        self.assertEqual(self.logical_samples(upgraded),
+                         [v << 2 for v in values])
+
+    def test_upscale_introduces_no_banding(self):
+        # a smooth 8-bit gradient upscaled to 10 bits must not gain
+        # intermediate levels: the number of distinct levels and the
+        # set of adjacent-sample steps stay exactly representable
+        values = [(i % 256) - 128 for i in range(2048)]
+        seg8 = self.make_segment(8, values)
+        upgraded = convert_bit_depth(seg8, 10)
+
+        in_levels = set(values)
+        out_levels = set(self.logical_samples(upgraded))
+        self.assertEqual(len(out_levels), len(in_levels))
+
+        def steps(samples):
+            return set(b - a for a, b in zip(samples, samples[1:]))
+
+        in_steps = steps(values)
+        out_steps = steps(self.logical_samples(upgraded))
+        # every output step is exactly the input step scaled by 4,
+        # no in-between (banding/artifact) steps appear
+        self.assertEqual(out_steps, set(s << 2 for s in in_steps))
+
+    def test_dither_strategies(self):
+        values = [v * 4 + 1 for v in range(-100, 100)]
+        seg10 = self.make_segment(10, values)
+
+        truncated = convert_bit_depth(seg10, 8, dither='none')
+        self.assertEqual(self.logical_samples(truncated),
+                         [v >> 2 for v in values])
+
+        dithered = convert_bit_depth(seg10, 8, dither='triangular')
+        self.assertEqual(dithered.bit_depth, 8)
+        # dither spreads the quantization error instead of banding:
+        # more distinct levels than plain truncation of a constant
+        flat = self.make_segment(10, [1] * 2000)
+        flat_truncated = convert_bit_depth(flat, 8, dither='none')
+        flat_dithered = convert_bit_depth(flat, 8, dither='triangular')
+        self.assertEqual(len(set(self.logical_samples(flat_truncated))), 1)
+        self.assertGreater(len(set(self.logical_samples(flat_dithered))), 1)
+        # and the mean stays close to the original value
+        mean = sum(self.logical_samples(flat_dithered)) / 2000.0
+        self.assertAlmostEqual(mean, 0.25, delta=0.2)
+
+        self.assertRaises(ValueError, convert_bit_depth, seg10, 8,
+                          dither='blue-noise')
+
+    def test_mixed_bit_depth_batch_is_per_item(self):
+        seg8 = self.make_segment(8, list(range(-128, 0)))
+        seg10 = self.make_segment(10, list(range(-512, 0)))
+        seg16 = self.make_segment(16, list(range(-1000, 0)))
+
+        # passthrough keeps each item at its own depth
+        batch = convert_batch([seg8, seg10, seg16])
+        self.assertEqual([s.bit_depth for s in batch], [8, 10, 16])
+
+        # explicit target converts each item from its own depth
+        batch = convert_batch([seg8, seg10, seg16], target_bit_depth=10)
+        self.assertEqual([s.bit_depth for s in batch], [10, 10, 10])
+        self.assertEqual(batch[0].get_array_of_samples().tolist(),
+                         [v << 8 for v in range(-128, 0)])
+        self.assertEqual(batch[1].raw_data, seg10.raw_data)
+
+    def test_mixed_bit_depth_concatenate_is_per_segment(self):
+        seg8 = self.make_segment(8, list(range(-128, 128)))
+        seg10 = self.make_segment(10, list(range(-512, 512, 4)))
+
+        out = concatenate([seg8, seg10])
+        # the mixed concat targets the highest depth, not the lowest
+        self.assertEqual(out.bit_depth, 10)
+        self.assertEqual(out.sample_width, 2)
+        self.assertEqual(len(out), len(seg8) + len(seg10))
+
+        samples = out.get_array_of_samples().tolist()
+        n8 = int(seg8.frame_count())
+        # first segment upscaled exactly, second segment untouched
+        self.assertEqual(samples[:n8],
+                         [v << 8 for v in range(-128, 128)])
+        self.assertEqual(samples[n8:], seg10.get_array_of_samples().tolist())
+
+    def test_unsupported_format_raises_with_suggestion(self):
+        seg = self.make_segment(10, [0] * 100)
+        out = BytesIO()
+        with self.assertRaises(UnsupportedBitDepthError) as ctx:
+            seg.export(out, format='mp3', bit_depth=10)
+        # the error suggests an alternative instead of silently
+        # downgrading to 8 bits
+        self.assertIn('wav', str(ctx.exception))
+        # nothing was written
+        self.assertEqual(out.getvalue(), b'')
+
+    def test_unsupported_codec_raises_with_suggestion(self):
+        seg = self.make_segment(10, [0] * 100)
+        with self.assertRaises(UnsupportedBitDepthError) as ctx:
+            seg.export(BytesIO(), format='wav', codec='pcm_s32le',
+                       bit_depth=10)
+        self.assertIn('pcm_s16le', str(ctx.exception))
+
+    def test_unknown_bit_depth_raises(self):
+        seg = self.make_segment(10, [0] * 100)
+        self.assertRaises(UnsupportedBitDepthError, seg.export,
+                          BytesIO(), format='wav', bit_depth=12)
+
+    def test_declared_depth_mismatch_is_detected(self):
+        # 16-bit samples declared as 8-bit: values exceed the range
+        seg16 = self.make_segment(16, [10000, -10000])
+        self.assertRaises(BitDepthMismatchError, validate_bit_depth,
+                          seg16, 8)
+        # same container but values fitting the declared depth pass
+        quiet = self.make_segment(8, [100, -100])
+        self.assertTrue(validate_bit_depth(quiet, 8))
+        # values using more precision than declared are detected too
+        sneaky = AudioSegment(
+            data=array.array('h', [1 << 4]).tobytes(),
+            sample_width=2, frame_rate=8000, channels=1, bit_depth=10)
+        self.assertRaises(BitDepthMismatchError, validate_bit_depth, sneaky)
+
+    def test_constructor_rejects_mismatched_bit_depth(self):
+        self.assertRaises(
+            ValueError,
+            AudioSegment, data=b'\x00\x00', sample_width=2,
+            frame_rate=8000, channels=1, bit_depth=8)
+        self.assertRaises(
+            ValueError,
+            AudioSegment, data=b'\x00', sample_width=1,
+            frame_rate=8000, channels=1, bit_depth=10)
+
+    def test_errors_and_logs_contain_no_paths_or_secrets(self):
+        seg = self.make_segment(10, [0] * 100)
+        secret_dir = os.path.join(gettempdir(), 'hunter2-secret-project')
+        os.makedirs(secret_dir, exist_ok=True)
+        secret_path = os.path.join(secret_dir, 'passwords.mp3')
+        try:
+            with self.assertLogs('pydub.bitdepth') as logs:
+                with self.assertRaises(UnsupportedBitDepthError) as ctx:
+                    seg.export(secret_path, format='mp3', bit_depth=10)
+            self.assertNotIn(secret_path, str(ctx.exception))
+            self.assertNotIn('hunter2', str(ctx.exception))
+            for record in logs.records:
+                self.assertNotIn(secret_path, record.getMessage())
+                self.assertNotIn('hunter2', record.getMessage())
+        finally:
+            if os.path.exists(secret_path):
+                os.unlink(secret_path)
+            os.rmdir(secret_dir)
+
+    def test_bit_depth_logging_enter_exit_failure(self):
+        seg = self.make_segment(8, [0] * 100)
+        with self.assertLogs('pydub.bitdepth', level='DEBUG') as logs:
+            convert_bit_depth(seg, 10)
+        messages = [r.getMessage() for r in logs.records]
+        self.assertTrue(any('enter' in m for m in messages))
+        self.assertTrue(any('exit' in m for m in messages))
+
+        with self.assertLogs('pydub.bitdepth', level='DEBUG') as logs:
+            self.assertRaises(UnsupportedBitDepthError, seg.export,
+                              BytesIO(), format='mp3', bit_depth=10)
+        levels = [r.levelname for r in logs.records]
+        self.assertIn('ERROR', levels)
+
+    def test_default_behavior_unchanged_without_new_params(self):
+        seg8 = self.make_segment(8, list(range(-128, 128)))
+        seg16 = self.make_segment(16, list(range(-1000, 1000)))
+
+        # bit depth defaults to the container depth
+        self.assertEqual(seg8.bit_depth, 8)
+        self.assertEqual(seg16.bit_depth, 16)
+
+        # default export output is byte-identical to an explicit export
+        # at the same depth (the explicit path adds no hidden steps)
+        default_out = seg16.export(BytesIO(), format='wav').getvalue()
+        explicit_out = seg16.export(BytesIO(), format='wav',
+                                    bit_depth=16).getvalue()
+        self.assertEqual(default_out, explicit_out)
+
+        # 8-bit wav export still biases to unsigned, as before
+        out = seg8.export(BytesIO(), format='wav')
+        out.seek(0)
+        wav_out = wave.open(out, 'rb')
+        self.assertEqual(wav_out.getsampwidth(), 1)
+        first_sample = wav_out.readframes(1)
+        self.assertEqual(first_sample, b'\x00')  # -128 biased to 0
+
+    def test_upscaled_file_size_stays_reasonable(self):
+        seg8 = self.make_segment(8, [0] * 1000)
+        raw8 = seg8.export(BytesIO(), format='raw').getvalue()
+        raw10 = seg8.export(BytesIO(), format='raw', bit_depth=10).getvalue()
+        # 10-bit lives in a 16-bit container: exactly 2x, not 4x
+        self.assertEqual(len(raw10), 2 * len(raw8))
+
+    def test_failed_export_leaves_no_partial_output(self):
+        seg = self.make_segment(10, [0] * 100)
+        out = BytesIO()
+        self.assertRaises(UnsupportedBitDepthError, seg.export,
+                          out, format='ogg', bit_depth=10)
+        self.assertEqual(len(out.getvalue()), 0)
+
+    def test_batch_failure_does_not_mutate_inputs(self):
+        good = self.make_segment(10, [0] * 100)
+        # declared 10-bit but the samples use more precision than that
+        bad = AudioSegment(
+            data=array.array('h', [32767]).tobytes(),
+            sample_width=2, frame_rate=8000, channels=1, bit_depth=10)
+        self.assertRaises(BitDepthMismatchError, convert_batch,
+                          [good, bad], target_bit_depth=8)
+        self.assertEqual(good.bit_depth, 10)
+        self.assertEqual(bad.bit_depth, 10)
+
+    def test_concurrent_conversion_is_thread_safe(self):
+        from concurrent.futures import ThreadPoolExecutor
+        segs = [self.make_segment(8, [i % 256 - 128] * 500)
+                for i in range(8)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(
+                lambda s: convert_bit_depth(s, 10, dither='triangular'),
+                segs))
+        for seg, result in zip(segs, results):
+            self.assertEqual(result.bit_depth, 10)
+            self.assertEqual(len(result.raw_data),
+                             len(seg.raw_data) * 2)
 
 
 if __name__ == "__main__":

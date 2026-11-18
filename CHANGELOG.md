@@ -1,3 +1,8 @@
+# unreleased
+- Add an explicit high bit-depth path (`pydub.bitdepth`): 10-bit (and 16/24/32-bit) audio is converted and exported without silently truncating to 8 bits, with per-item batch conversion, mixed-depth concatenation, configurable dither, and `bit_depth`/`dither` keyword arguments on `AudioSegment.export()`. Defaults are unchanged from previous behavior.
+- Add `AudioSegment.bit_depth` (defaults to the container depth) and `UnsupportedBitDepthError`/`BitDepthMismatchError` exceptions
+- Fix importing pydub on Python 3.13+ where the stdlib `audioop` module was removed (uses `audioop-lts`, with the bundled `pyaudioop` as fallback)
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 
